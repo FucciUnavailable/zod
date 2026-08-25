@@ -1,6 +1,6 @@
 import type * as JSONSchema from "../core/json-schema.js";
 import { type $ZodRegistry, globalRegistry } from "../core/registries.js";
-import { assignProp, isPlainObject } from "../core/util.js";
+import { assignProp, isPlainObject, numKeys } from "../core/util.js";
 import * as _checks from "./checks.js";
 import * as _iso from "./iso.js";
 import * as _schemas from "./schemas.js";
@@ -154,28 +154,60 @@ function resolveRef(ref: string, ctx: ConversionContext): JSONSchema.JSONSchema 
   throw new Error(`Reference not found: ${ref}`);
 }
 
+interface KeyConstraints {
+  keySchema?: ZodType | undefined;
+  minProperties?: number | undefined;
+  maxProperties?: number | undefined;
+}
+
 /**
- * Rejects every own key that fails `keySchema`, before `objectSchema` runs. The
- * guard has to see the raw input: an object parse drops `__proto__` and can add
- * keys from a property `default`, so its output is not the set of names the
- * instance actually carried.
+ * Enforces the keyword group that constrains an instance's own keys rather than
+ * its values, before `objectSchema` runs. The guard has to see the raw input: an
+ * object parse drops `__proto__` and can add keys from a property `default`, so
+ * its output is neither the set of names nor the count the instance carried.
  */
-function checkPropertyNames(objectSchema: ZodType, keySchema: ZodType): ZodType {
+function checkKeys(objectSchema: ZodType, { keySchema, minProperties, maxProperties }: KeyConstraints): ZodType {
   // An identity transform, not z.any(), so `toJSONSchema` reports the object on both the input and the output side of the pipe.
   const guard = z
     .transform((value: unknown) => value)
     .check((payload) => {
       const value = payload.value;
       if (typeof value !== "object" || value === null || Array.isArray(value)) return;
-      for (const key of Object.getOwnPropertyNames(value)) {
-        const result = keySchema.safeParse(key);
-        if (result.success) continue;
+      if (keySchema) {
+        for (const key of Object.getOwnPropertyNames(value)) {
+          const result = keySchema.safeParse(key);
+          if (result.success) continue;
+          payload.issues.push({
+            code: "invalid_key",
+            origin: "record",
+            issues: result.error.issues,
+            input: key,
+            path: [key],
+            continue: true,
+          });
+        }
+      }
+
+      if (minProperties === undefined && maxProperties === undefined) return;
+      // own enumerable keys, matching the members a JSON object would serialize
+      const count = numKeys(value);
+      if (minProperties !== undefined && count < minProperties) {
         payload.issues.push({
-          code: "invalid_key",
-          origin: "record",
-          issues: result.error.issues,
-          input: key,
-          path: [key],
+          code: "too_small",
+          origin: "object",
+          minimum: minProperties,
+          inclusive: true,
+          input: value,
+          continue: true,
+        });
+      }
+      if (maxProperties !== undefined && count > maxProperties) {
+        payload.issues.push({
+          code: "too_big",
+          origin: "object",
+          maximum: maxProperties,
+          inclusive: true,
+          input: value,
           continue: true,
         });
       }
@@ -518,14 +550,21 @@ function convertBaseSchema(schema: JSONSchema.JSONSchema, ctx: ConversionContext
         }
       }
 
-      // propertyNames constrains key *names* only, and says nothing about which keys are required or how their values validate. Layering it on top of the result keeps properties/patternProperties/additionalProperties composing underneath. `true` allows every name, so it needs no guard.
+      // propertyNames constrains key *names* only, and says nothing about which keys are required or how their values validate. Layering it and the property-count keywords on top of the result keeps properties/patternProperties/additionalProperties composing underneath. `true` allows every name, so it needs no guard.
+      let keySchema: ZodType | undefined;
       if (schema.propertyNames !== undefined && schema.propertyNames !== true) {
         // Keys are always strings, so a propertyNames subschema that omits `type` still constrains them — without this it would convert to z.any().
         const keyJSONSchema =
           typeof schema.propertyNames === "object" && schema.propertyNames.type === undefined
             ? { type: "string", ...schema.propertyNames }
             : schema.propertyNames;
-        zodSchema = checkPropertyNames(zodSchema, convertSchema(keyJSONSchema as JSONSchema.JSONSchema, ctx));
+        keySchema = convertSchema(keyJSONSchema as JSONSchema.JSONSchema, ctx);
+      }
+
+      const minProperties = typeof schema.minProperties === "number" ? schema.minProperties : undefined;
+      const maxProperties = typeof schema.maxProperties === "number" ? schema.maxProperties : undefined;
+      if (keySchema !== undefined || minProperties !== undefined || maxProperties !== undefined) {
+        zodSchema = checkKeys(zodSchema, { keySchema, minProperties, maxProperties });
       }
       break;
     }
@@ -666,9 +705,13 @@ function convertSchema(schema: JSONSchema.JSONSchema | boolean, ctx: ConversionC
     }
   }
 
-  // `propertyNames` is enforced by a key guard, which `toJSONSchema` cannot infer, so the original keyword is carried as metadata to keep the round-trip lossless. Only where it was actually applied: on any other type it is inert, and on a `$ref` the metadata would land on the target every reference shares.
-  if (schema.propertyNames !== undefined && schema.type === "object" && schema.$ref === undefined) {
-    extraMeta.propertyNames = schema.propertyNames;
+  // The key-guard keywords are enforced by a check, which `toJSONSchema` cannot infer, so the originals are carried as metadata to keep the round-trip lossless. Only where they were actually applied: on any other type they are inert, and on a `$ref` the metadata would land on the target every reference shares.
+  if (schema.type === "object" && schema.$ref === undefined) {
+    for (const key of ["propertyNames", "minProperties", "maxProperties"]) {
+      if (schema[key] !== undefined) {
+        extraMeta[key] = schema[key];
+      }
+    }
   }
 
   for (const key of Object.keys(schema)) {

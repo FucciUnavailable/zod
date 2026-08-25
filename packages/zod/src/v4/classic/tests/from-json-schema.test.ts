@@ -641,6 +641,80 @@ test("propertyNames survives a toJSONSchema round trip", () => {
   }
 });
 
+test("minProperties and maxProperties constrain the key count", () => {
+  const schema = fromJSONSchema({
+    type: "object",
+    properties: { a: { type: "string" }, b: { type: "number" } },
+    minProperties: 1,
+    maxProperties: 2,
+  });
+  expect(schema.parse({ a: "x" })).toEqual({ a: "x" });
+  expect(schema.parse({ a: "x", b: 1 })).toEqual({ a: "x", b: 1 });
+  expect(() => schema.parse({})).toThrow();
+  expect(() => schema.parse({ a: "x", b: 1, c: true })).toThrow();
+
+  // both bounds are inclusive
+  expect(fromJSONSchema({ type: "object", minProperties: 0 }).parse({})).toEqual({});
+  expect(() => fromJSONSchema({ type: "object", maxProperties: 0 }).parse({ a: 1 })).toThrow();
+});
+
+test("property count is taken from the instance, not the parsed output", () => {
+  // A property `default` synthesizes a key the instance never carried.
+  const withDefault = fromJSONSchema({
+    type: "object",
+    properties: { a: { type: "string", default: "x" } },
+    minProperties: 1,
+  });
+  expect(() => withDefault.parse({})).toThrow();
+
+  // An object parse strips `__proto__`; the instance still carried the key.
+  expect(fromJSONSchema({ type: "object", minProperties: 1 }).parse(JSON.parse('{"__proto__":1}'))).toEqual({});
+});
+
+test("property count issues report a bounded object origin", () => {
+  const tooSmall = fromJSONSchema({ type: "object", minProperties: 2 }).safeParse({ a: 1 });
+  expect(tooSmall.error!.issues[0]).toMatchObject({ code: "too_small", origin: "object", minimum: 2 });
+
+  const tooBig = fromJSONSchema({ type: "object", maxProperties: 1 }).safeParse({ a: 1, b: 2 });
+  expect(tooBig.error!.issues[0]).toMatchObject({ code: "too_big", origin: "object", maximum: 1 });
+});
+
+test("property count composes with the other object keywords", () => {
+  // propertyNames shares the guard: both keywords must still report.
+  const withNames = fromJSONSchema({
+    type: "object",
+    propertyNames: { pattern: "^a" },
+    maxProperties: 1,
+  }).safeParse({ ab: 1, b: 2 });
+  expect(withNames.error!.issues.map((i) => i.code).sort()).toEqual(["invalid_key", "too_big"]);
+
+  // patternProperties builds an intersection rather than a plain object; the guard layers on top of either.
+  const withPatterns = fromJSONSchema({
+    type: "object",
+    patternProperties: { "^S_": { type: "string" } },
+    minProperties: 2,
+  });
+  expect(withPatterns.parse({ S_a: "x", S_b: "y" })).toEqual({ S_a: "x", S_b: "y" });
+  expect(() => withPatterns.parse({ S_a: "x" })).toThrow();
+});
+
+test("property count keywords are inert on non-objects", () => {
+  expect(fromJSONSchema({ type: "string", minProperties: 2 }).parse("hi")).toBe("hi");
+  expect(fromJSONSchema({ type: "array", items: { type: "number" }, maxProperties: 0 }).parse([1, 2])).toEqual([1, 2]);
+});
+
+test("property count keywords survive a toJSONSchema round trip", () => {
+  const roundTripped = z.toJSONSchema(fromJSONSchema({ type: "object", minProperties: 1, maxProperties: 3 })) as Record<
+    string,
+    unknown
+  >;
+  expect(roundTripped.minProperties).toBe(1);
+  expect(roundTripped.maxProperties).toBe(3);
+
+  // Not an object: nothing enforces them, so they must not be advertised either.
+  expect(z.toJSONSchema(fromJSONSchema({ type: "string", minProperties: 1 }))).not.toHaveProperty("minProperties");
+});
+
 test("patternProperties with regular properties", () => {
   // Note: When patternProperties is combined with properties, the intersection validates all keys against the pattern. This test uses a pattern that matches the regular property name as well.
   const schema = fromJSONSchema({
